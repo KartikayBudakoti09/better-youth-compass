@@ -1,0 +1,18 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "node",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+
+    "DATABRICKS_HOST": "https://adb-xxxx.azuredatabricks.net",
+    "DATABRICKS_TOKEN": "PASTE_YOUR_DATABRICKS_PAT",
+    "DATABRICKS_WAREHOUSE_ID": "PASTE_YOUR_WAREHOUSE_ID",
+    "DATABRICKS_CATALOG": "Hackathon2",
+    "DATABRICKS_SCHEMA": "amer",
+
+    "AZURE_OPENAI_ENDPOINT": "https://YOUR-RESOURCE.openai.azure.com",
+    "AZURE_OPENAI_KEY": "PASTE_YOUR_AZURE_OPENAI_KEY",
+    "AZURE_OPENAI_DEPLOYMENT": "YOUR_DEPLOYMENT_NAME",
+    "AZURE_OPENAI_API_VERSION": "2024-04-01-preview"
+  }
+}
