@@ -2,120 +2,156 @@ import { app, HttpRequest, HttpResponseInit, InvocationContext } from "@azure/fu
 import { runSql } from "../lib/databricks.js";
 import { ENV } from "../lib/env.js";
 
-type Col = string;
-
-function colList(rows: any[]): string[] {
-  // metaDescribe returns many shapes; this is defensive
+function normalizeCols(rows: any[]): string[] {
+  // DESCRIBE TABLE returns different shapes depending on driver.
+  // Common patterns: { col_name }, { column_name }, or c0
   return (rows || [])
-    .map((r) => (r?.col_name ?? r?.colName ?? r?.name ?? r?.c0 ?? r?.[0] ?? "").toString().trim())
+    .map((r: any) => (r.col_name ?? r.column_name ?? r.c0 ?? r[0] ?? "").toString())
+    .map((s: string) => s.trim())
     .filter(Boolean)
-    .filter((x) => !x.startsWith("#"))
-    .filter((x) => x.toLowerCase() !== "col_name");
+    .filter((name: string) => !name.startsWith("#")); // databricks describe headers
 }
 
-function pick(cols: Col[], candidates: string[]): string | null {
-  const lower = new Map(cols.map((c) => [c.toLowerCase(), c]));
-  for (const cand of candidates) {
-    const hit = lower.get(cand.toLowerCase());
-    if (hit) return hit;
-  }
-  return null;
-}
+export async function attendanceHeatmap(
+  req: HttpRequest,
+  ctx: InvocationContext
+): Promise<HttpResponseInit> {
+  const fq = (t: string) => `${ENV.DATABRICKS_CATALOG}.${ENV.DATABRICKS_SCHEMA}.${t}`;
 
-async function describeTable(catalog: string, schema: string, table: string) {
-  const rows = await runSql(`DESCRIBE ${catalog}.${schema}.${table}`);
-  return colList(rows);
-}
+  // 1) Inspect columns so we don't "assume" the schema
+  const descAttendance = await runSql(`DESCRIBE TABLE ${fq("attendance")}`);
+  const aCols = normalizeCols(descAttendance);
 
-export async function attendanceHeatmap(req: HttpRequest, ctx: InvocationContext): Promise<HttpResponseInit> {
-  const catalog = ENV.DATABRICKS_CATALOG; // you have hackathon
-  const schema = ENV.DATABRICKS_SCHEMA;   // you have amer
+  const descSessions = await runSql(`DESCRIBE TABLE ${fq("program_sessions")}`);
+  const psCols = normalizeCols(descSessions);
 
-  // Describe tables to avoid guessing column names
-  const attendanceCols = await describeTable(catalog, schema, "attendance");
-  const sessionCols = await describeTable(catalog, schema, "program_sessions");
-  const programsCols = await describeTable(catalog, schema, "programs");
+  const descPrograms = await runSql(`DESCRIBE TABLE ${fq("programs")}`);
+  const pCols = normalizeCols(descPrograms);
 
-  const aDate = pick(attendanceCols, ["attendance_date", "date", "session_date"]);
-  const aSessionId = pick(attendanceCols, ["session_id", "program_session_id", "sessionid"]);
-  const aStatus = pick(attendanceCols, ["attendance_status", "status"]);
+  // 2) Decide join columns safely
+  const aSessionCol = aCols.includes("session_id") ? "session_id" : null;
+  const psSessionCol = psCols.includes("session_id") ? "session_id" : null;
 
-  if (!aDate || !aSessionId) {
+  const psProgramCol =
+    psCols.includes("program_id") ? "program_id" :
+    psCols.includes("program") ? "program" :
+    null;
+
+  const pProgramIdCol =
+    pCols.includes("program_id") ? "program_id" :
+    pCols.includes("id") ? "id" :
+    null;
+
+  const pProgramNameCol =
+    pCols.includes("program_name") ? "program_name" :
+    pCols.includes("name") ? "name" :
+    null;
+
+  if (!aSessionCol || !psSessionCol) {
     return {
       status: 500,
       jsonBody: {
-        error: "Attendance table is missing required columns to build the heatmap.",
-        required: ["attendance_date (or equivalent)", "session_id (or equivalent)"],
-        attendanceColumns: attendanceCols,
-      },
+        error: "Missing join key for attendance -> program_sessions",
+        attendanceColumns: aCols,
+        programSessionsColumns: psCols
+      }
     };
   }
-
-  // program_sessions join keys
-  const sSessionId = pick(sessionCols, ["session_id", "id"]);
-  const sProgramId = pick(sessionCols, ["program_id", "programid"]);
-
-  if (!sSessionId || !sProgramId) {
+  if (!psProgramCol || !pProgramIdCol || !pProgramNameCol) {
     return {
       status: 500,
       jsonBody: {
-        error: "program_sessions table is missing required columns to join attendance -> programs.",
-        required: ["session_id (or id)", "program_id"],
-        program_sessions_columns: sessionCols,
-      },
+        error: "Missing join key for program_sessions -> programs",
+        programSessionsColumns: psCols,
+        programsColumns: pCols
+      }
     };
   }
 
-  // programs columns
-  const pProgramId = pick(programsCols, ["program_id", "id"]);
-  const pProgramName = pick(programsCols, ["program_name", "name", "title"]);
+  // 3) Decide how to compute PRESENT without assuming a 'present' boolean
+  let presentExpr: string | null = null;
 
-  if (!pProgramId) {
-    return {
-      status: 500,
-      jsonBody: {
-        error: "programs table is missing program_id/id column.",
-        programs_columns: programsCols,
-      },
-    };
-  }
-
-  // Presence logic: if attendance_status exists, treat these as "present"
-  // (you can tweak list if your data uses different values)
-  const presentExpr = aStatus
-    ? `
+  if (aCols.includes("present")) {
+    presentExpr = `CASE WHEN a.present = true THEN 1 ELSE 0 END`;
+  } else if (aCols.includes("is_present")) {
+    presentExpr = `CASE WHEN a.is_present = true THEN 1 ELSE 0 END`;
+  } else if (aCols.includes("attendance_status")) {
+    // Your table has this column (per your screenshot).
+    // Treat common variants as "present"
+    presentExpr = `
       CASE
-        WHEN lower(a.${aStatus}) IN ('present','attended','checked_in','on_time','late') THEN 1
+        WHEN lower(trim(a.attendance_status)) IN ('present','attended','in','yes','y') THEN 1
         ELSE 0
       END
-    `
-    : `0`;
+    `;
+  } else if (aCols.includes("status")) {
+    presentExpr = `
+      CASE
+        WHEN lower(trim(a.status)) IN ('present','attended','in','yes','y') THEN 1
+        ELSE 0
+      END
+    `;
+  }
 
-  const programLabel = pProgramName ? `p.${pProgramName}` : `cast(p.${pProgramId} as string)`;
+  if (!presentExpr) {
+    return {
+      status: 500,
+      jsonBody: {
+        error: "Could not find a present/attendance flag column in attendance table",
+        attendanceColumns: aCols
+      }
+    };
+  }
 
+  // 4) Attendance date column
+  const dateCol =
+    aCols.includes("attendance_date") ? "attendance_date" :
+    aCols.includes("date") ? "date" :
+    null;
+
+  if (!dateCol) {
+    return {
+      status: 500,
+      jsonBody: { error: "No attendance date column found", attendanceColumns: aCols }
+    };
+  }
+
+  // 5) Build heatmap query (day-of-week x program)
+  // Use date_sub(current_date(), 90) to avoid timestamp casting issues.
+  // dayofweek() returns 1-7 (Sun..Sat) in Spark SQL.
   const sql = `
     SELECT
-      dayofweek(a.${aDate}) AS dow,
-      ${programLabel} AS program,
+      dayofweek(a.${dateCol}) AS dow,
+      p.${pProgramNameCol} AS program,
       AVG(${presentExpr}) AS attendance_rate
-    FROM ${catalog}.${schema}.attendance a
-    JOIN ${catalog}.${schema}.program_sessions s
-      ON a.${aSessionId} = s.${sSessionId}
-    JOIN ${catalog}.${schema}.programs p
-      ON s.${sProgramId} = p.${pProgramId}
-    WHERE a.${aDate} >= dateadd(day, -90, current_date())
+    FROM ${fq("attendance")} a
+    JOIN ${fq("program_sessions")} ps
+      ON a.${aSessionCol} = ps.${psSessionCol}
+    JOIN ${fq("programs")} p
+      ON ps.${psProgramCol} = p.${pProgramIdCol}
+    WHERE a.${dateCol} >= date_sub(current_date(), 90)
     GROUP BY 1,2
     ORDER BY 2,1
-    LIMIT 700
   `;
 
   const rows = await runSql(sql);
-  return { jsonBody: { catalog, schema, rows } };
+
+  // Return a clean shape the frontend can consume
+  return {
+    jsonBody: {
+      rows: rows.map((r: any) => ({
+        // normalize possible driver shapes: {dow, program, attendance_rate} or {c0,c1,c2}
+        dow: r.dow ?? r.c0 ?? r[0],
+        program: r.program ?? r.c1 ?? r[1],
+        attendance_rate: r.attendance_rate ?? r.c2 ?? r[2]
+      }))
+    }
+  };
 }
 
 app.http("attendanceHeatmap", {
   methods: ["GET"],
   authLevel: "anonymous",
   route: "analytics/attendance-heatmap",
-  handler: attendanceHeatmap,
+  handler: attendanceHeatmap
 });
