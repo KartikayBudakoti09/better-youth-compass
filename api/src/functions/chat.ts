@@ -1,8 +1,9 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from "@azure/functions";
 import { aoai } from "../lib/openai.js";
+import { ENV } from "../lib/env.js"
 
 export async function chat(req: HttpRequest, ctx: InvocationContext): Promise<HttpResponseInit> {
-  const body = await req.json().catch(() => ({}));
+  const body: any = await req.json().catch(() => ({}));
   const role = (body.role ?? "student") as "student" | "mentor";
   const message = String(body.message ?? "").trim();
 
@@ -14,6 +15,7 @@ export async function chat(req: HttpRequest, ctx: InvocationContext): Promise<Ht
       : "You are a friendly tutor for Better Youth students. Explain step-by-step, simple language, give short practice tasks.";
 
   const resp = await aoai.chat.completions.create({
+    model: ENV.AZURE_OPENAI_DEPLOYMENT,
     messages: [
       { role: "system", content: system },
       { role: "user", content: message }
@@ -21,8 +23,9 @@ export async function chat(req: HttpRequest, ctx: InvocationContext): Promise<Ht
     temperature: 0.4
   });
 
-  const answer = resp.choices?.[0]?.message?.content ?? "";
-  return { jsonBody: { answer } };
+  return { jsonBody: { 
+    answer: resp.choices[0].message.content
+   } };
 }
 
 app.http("chat", {

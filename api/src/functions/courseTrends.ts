@@ -4,7 +4,7 @@ import { ENV } from "../lib/env.js";
 
 function colNames(rows: any[]): string[] {
   return rows
-    .map((r) => r.col_name ?? r.colName ?? r.name ?? r.c1 ?? r[0])
+    .map((r) => r.col_name ?? r.colName ?? r.c1 ?? r.name ?? r[0])
     .filter((x) => typeof x === "string")
     .map((s) => s.trim())
     .filter(Boolean)
